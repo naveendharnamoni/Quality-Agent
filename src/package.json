@@ -1,0 +1,58 @@
+{
+  "name": "coverage-agent",
+  "displayName": "@coverage Agent",
+  "description": "VS Code Chat Participant — resolves SonarQube coverage gaps with AI-generated tests",
+  "version": "0.1.0",
+  "engines": { "vscode": "^1.90.0" },
+  "categories": ["AI", "Testing"],
+  "activationEvents": [],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "chatParticipants": [
+      {
+        "id": "coverage",
+        "name": "coverage",
+        "description": "Resolves SonarQube coverage gaps by generating targeted unit tests",
+        "isSticky": false
+      }
+    ],
+    "commands": [
+      {
+        "command": "coverage.approveTest",
+        "title": "Coverage: Approve & Apply Generated Test"
+      },
+      {
+        "command": "coverage.rejectTest",
+        "title": "Coverage: Reject Generated Test"
+      }
+    ],
+    "configuration": {
+      "title": "Coverage Agent",
+      "properties": {
+        "coverage.sonarUrl": {
+          "type": "string",
+          "description": "SonarQube server URL (e.g. https://sonar.yourorg.com)"
+        },
+        "coverage.sonarToken": {
+          "type": "string",
+          "description": "SonarQube API token — store via VS Code secret storage in production"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build":   "tsc -p tsconfig.json",
+    "watch":   "tsc -watch -p tsconfig.json",
+    "package": "vsce package",
+    "lint":    "eslint src --ext ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.24.0"
+  },
+  "devDependencies": {
+    "@types/node":   "^20.0.0",
+    "@types/vscode": "^1.90.0",
+    "typescript":    "^5.4.0",
+    "@vscode/vsce":  "^2.26.0"
+  }
+}
