@@ -9,14 +9,14 @@ export type ProjectType = 'dotnet' | 'angular' | 'react';
 // ── Org Pattern Config ───────────────────────────────────────
 
 export interface PatternSpec {
-  framework:  string;       // xUnit | Jasmine | Jest
-  mocking:    string;       // Moq | SpyObj | jest.mock
-  assertion:  string;       // FluentAssertions | expect()
+  framework:  string;
+  mocking:    string;
+  assertion:  string;
   pattern:    'AAA';
-  naming:     string;       // "{Method}_Should_{Behavior}_When_{Condition}"
-  baseClass?: string;       // BaseApiTest (dotnet only)
-  fixtures?:  string[];     // WebApplicationFactory, InMemoryDb ...
-  utilities?: string[];     // TestBed, render, screen ...
+  naming:     string;
+  baseClass?: string;
+  fixtures?:  string[];
+  utilities?: string[];
   maxRetries: number;
 }
 
@@ -26,13 +26,13 @@ export interface OrgConfig {
   react:   PatternSpec;
 }
 
-// ── Sonar ────────────────────────────────────────────────────
+// ── Sonar (via MCP server) ───────────────────────────────────
 
 export type SonarIssueType = 'coverage' | 'branch_coverage' | 'vulnerability';
 
 export interface SonarIssue {
-  file: string;             // "OrderService.cs"
-  line: number;             // 145
+  file: string;
+  line: number;
   type: SonarIssueType;
 }
 
@@ -45,12 +45,10 @@ export interface SonarFetchOutput {
   issues: SonarIssue[];
 }
 
-// ── Coverage Baseline ────────────────────────────────────────
-
 export interface CoverageBaseline {
-  coverage:       number;   // 72.4
-  branchCoverage: number;   // 68.9
-  issueCount:     number;   // 42
+  coverage:       number;
+  branchCoverage: number;
+  issueCount:     number;
 }
 
 // ── Symbols / LSP ────────────────────────────────────────────
@@ -62,14 +60,16 @@ export interface SymbolLocation {
   line:   number;
 }
 
-export interface Reference {
-  callee:    string;        // method name called
-  interface: string;        // interface it belongs to
+// Caller info from prepareCallHierarchy + provideIncomingCalls
+export interface CallerInfo {
+  callerClass:  string;
+  callerMethod: string;
+  interface:    string;
 }
 
 export interface FindReferencesOutput {
-  method:     string;
-  references: Reference[];
+  method:  string;
+  callers: CallerInfo[];
 }
 
 export interface FindTestsOutput {
@@ -80,8 +80,8 @@ export interface FindTestsOutput {
 // ── Dependency Graph ─────────────────────────────────────────
 
 export interface Dependency {
-  interface: string;        // "IRepository<Order>"
-  mockName:  string;        // "_repository"
+  interface: string;
+  mockName:  string;
 }
 
 export interface DependencyGraphOutput {
@@ -118,8 +118,8 @@ export interface BuildVerifyOutput {
   buildSuccess:   boolean;
   testsPassed:    number;
   testsFailed:    number;
-  error?:         string;   // compiler / runtime error message
-  failureReason?: string;   // human-readable reason for retry context
+  error?:         string;
+  failureReason?: string;
   coverageFile:   string | null;
 }
 
@@ -143,10 +143,10 @@ export interface GenerateTestInput {
 }
 
 export interface GeneratedTest {
-  fileName: string;         // "OrderServiceTests.cs"
-  testName: string;         // "CreateOrder_Should_Throw_When_RepositoryFails"
-  strategy: string;         // "mock_throw" — written to memory after attempt
-  code:     string;         // full test method source
+  fileName: string;
+  testName: string;
+  strategy: string;
+  code:     string;
 }
 
 // ── Loop State ───────────────────────────────────────────────

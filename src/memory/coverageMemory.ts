@@ -1,7 +1,7 @@
 // ─────────────────────────────────────────────────────────────
 // @coverage agent — Coverage Memory
-// Persists attempt history per file+line to prevent
-// the agent repeating the same failing strategy
+// Persists attempt history per file+line using VS Code globalState.
+// Prevents the agent repeating the same failing strategy.
 // ─────────────────────────────────────────────────────────────
 
 import * as vscode from 'vscode';
@@ -19,13 +19,13 @@ export class CoverageMemory {
     return `coverage-memory:${file}:${line}`;
   }
 
-  // ── coverage_memory.read ────────────────────────────────
+  // ── coverage_memory.read ─────────────────────────────────
 
   async read(file: string, line: number): Promise<CoverageMemoryRecord | null> {
     return this.store.get<CoverageMemoryRecord>(this.key(file, line)) ?? null;
   }
 
-  // ── coverage_memory.write — after failed attempt ────────
+  // ── coverage_memory.write — failed attempt ───────────────
 
   async writeFailure(
     file:     string,
@@ -49,7 +49,7 @@ export class CoverageMemory {
     await this.store.update(this.key(file, line), record);
   }
 
-  // ── coverage_memory.write — on success ─────────────────
+  // ── coverage_memory.write — success ─────────────────────
 
   async writeSuccess(file: string, line: number): Promise<void> {
     const existing = await this.read(file, line);
@@ -59,26 +59,22 @@ export class CoverageMemory {
         file, line, attempted: true, attemptCount: 1,
         failureReason: '', strategiesAttempted: [],
       }),
-      resolved:  true,
-      escalate:  false,
+      resolved: true,
+      escalate: false,
     } as CoverageMemoryRecord;
 
     await this.store.update(this.key(file, line), record);
   }
 
-  // ── coverage_memory.write — on escalation ──────────────
+  // ── coverage_memory.write — escalation ──────────────────
 
   async writeEscalation(file: string, line: number): Promise<void> {
     const existing = await this.read(file, line);
     if (!existing) { return; }
-
-    await this.store.update(this.key(file, line), {
-      ...existing,
-      escalate: true,
-    });
+    await this.store.update(this.key(file, line), { ...existing, escalate: true });
   }
 
-  // ── Helpers ─────────────────────────────────────────────
+  // ── Helpers ──────────────────────────────────────────────
 
   isEscalated(record: CoverageMemoryRecord | null): boolean {
     return record?.escalate === true;

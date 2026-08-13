@@ -1,7 +1,16 @@
 // ─────────────────────────────────────────────────────────────
-// @coverage agent — generate_test (native LLM action)
-// Builds the prompt from all context and calls the LLM.
-// This is NOT a tool call — it is the agent's core action.
+// @coverage agent — generate_test (LLM native action)
+//
+// Builds the prompt from all gathered context and calls
+// the Anthropic SDK. This is NOT a tool call — it is the
+// agent's core action. The LLM generates the test; the tools
+// gather the context that makes it accurate.
+//
+// Key prompt inputs:
+//   PatternSpec   → org naming convention + framework (injected verbatim)
+//   dependencies  → what to mock and exact mock variable names
+//   codeAnalysis  → which branches/exceptions need hitting
+//   memory        → strategies already tried (agent must avoid repeating)
 // ─────────────────────────────────────────────────────────────
 
 import Anthropic from '@anthropic-ai/sdk';
@@ -11,38 +20,44 @@ const client = new Anthropic(); // reads ANTHROPIC_API_KEY from env
 
 export async function generateTest(input: GenerateTestInput): Promise<GeneratedTest> {
   const {
-    sonarIssue, patternSpec, symbol,
-    references, existingTests,
-    dependencies, codeAnalysis, memory,
+    sonarIssue,
+    patternSpec,
+    symbol,
+    existingTests,
+    dependencies,
+    codeAnalysis,
+    memory,
   } = input;
 
-  // ── Build strategy guidance from memory ─────────────────
+  // ── Memory context — tells the LLM what NOT to repeat ────
   const memoryContext = memory
     ? `
 PREVIOUS ATTEMPTS: ${memory.attemptCount}
-STRATEGIES ALREADY TRIED (do NOT repeat): ${memory.strategiesAttempted.join(', ')}
+STRATEGIES ALREADY TRIED — do NOT repeat any of these:
+${memory.strategiesAttempted.map(s => `  - ${s}`).join('\n')}
 LAST FAILURE REASON: ${memory.failureReason}
 
-Choose a DIFFERENT strategy from those already attempted.
+You MUST choose a strategy not in the list above.
     `.trim()
-    : 'This is the first attempt. Start with the most likely scenario (e.g. null input, guard clause).';
+    : 'First attempt. Start with the most likely scenario (null input, guard clause, or happy path branch).';
 
-  // ── Build existing test examples ─────────────────────────
+  // ── Existing test examples ────────────────────────────────
   const existingTestsContext = existingTests.existingTests.length
-    ? `EXISTING TEST NAMES IN THIS CLASS (follow this naming style exactly):
-${existingTests.existingTests.map(t => `  - ${t}`).join('\n')}`
-    : 'No existing tests found. Use the naming convention from the pattern spec.';
+    ? `EXISTING TESTS IN THIS CLASS — follow this naming style exactly:\n${
+        existingTests.existingTests.map(t => `  - ${t}`).join('\n')
+      }`
+    : `No existing tests found. Use the naming convention: ${patternSpec.naming}`;
 
-  // ── Build dependency mock list ───────────────────────────
+  // ── Dependency mock list ──────────────────────────────────
   const depsContext = dependencies.dependencies.length
     ? dependencies.dependencies
-        .map(d => `  - ${d.interface} → mock as ${d.mockName}`)
+        .map(d => `  - Mock<${d.interface}> as ${d.mockName}`)
         .join('\n')
     : 'No constructor dependencies detected.';
 
-  // ── Final prompt ─────────────────────────────────────────
+  // ── Full prompt ───────────────────────────────────────────
   const prompt = `
-You are a senior ${patternSpec.framework} test engineer.
+You are a senior ${patternSpec.framework} test engineer for a .NET/Angular/React organisation.
 
 Generate a SINGLE unit test that covers the following SonarQube issue:
 
@@ -51,41 +66,41 @@ TARGET
   Line:   ${sonarIssue.line}
   Method: ${symbol.class}.${symbol.method}
 
-ORG TEST PATTERN
-  Framework:  ${patternSpec.framework}
-  Mocking:    ${patternSpec.mocking}
-  Assertion:  ${patternSpec.assertion}
-  Pattern:    ${patternSpec.pattern} (Arrange / Act / Assert)
-  Naming:     ${patternSpec.naming}
-  ${patternSpec.baseClass ? `Base class: ${patternSpec.baseClass}` : ''}
+ORG TEST PATTERN — follow these exactly, no exceptions
+  Framework:       ${patternSpec.framework}
+  Mocking library: ${patternSpec.mocking}
+  Assertion:       ${patternSpec.assertion}
+  Structure:       ${patternSpec.pattern} (Arrange / Act / Assert — use comments)
+  Naming:          ${patternSpec.naming}
+  ${patternSpec.baseClass ? `Base class: inherit from ${patternSpec.baseClass}` : ''}
+  ${patternSpec.utilities?.length ? `Utilities: ${patternSpec.utilities.join(', ')}` : ''}
 
 ${existingTestsContext}
 
-CONSTRUCTOR DEPENDENCIES TO MOCK
+CONSTRUCTOR DEPENDENCIES — set up ALL of these as mocks
 ${depsContext}
 
 METHOD ANALYSIS
-  Branches:   ${codeAnalysis.branches}
-  Exceptions: ${codeAnalysis.exceptions}
-  Guards:     ${codeAnalysis.guards.join('; ') || 'none'}
-  Deps used in this method: ${codeAnalysis.dependenciesUsed.join(', ') || 'none'}
+  Branches:          ${codeAnalysis.branches}
+  Exception paths:   ${codeAnalysis.exceptions}
+  Guard clauses:     ${codeAnalysis.guards.join('; ') || 'none'}
+  Dependencies used in this method: ${codeAnalysis.dependenciesUsed.join(', ') || 'none'}
 
 ${memoryContext}
 
-RULES
-1. Cover line ${sonarIssue.line} specifically — not just any line
-2. Follow the ${patternSpec.pattern} pattern with clear Arrange/Act/Assert comments
-3. Use ${patternSpec.mocking} for all mocks
-4. Name the test exactly following: ${patternSpec.naming}
+RULES — strictly enforced
+1. Cover line ${sonarIssue.line} specifically — not just any line in the method
+2. Include all necessary using/import statements so the test compiles
+3. Name the test following EXACTLY: ${patternSpec.naming}
+4. Use ${patternSpec.mocking} for all mocks — no other mocking library
 5. Do NOT use [Fact] and [Theory] together — pick one
-6. The test must COMPILE — include all necessary using statements
-7. Return ONLY the test method code, no class wrapper, no explanation
+6. Return ONLY the test method — no class wrapper, no explanation, no markdown
 
-Respond in this exact JSON format:
+Respond in this exact JSON format — no preamble, no backticks:
 {
   "testName": "...",
-  "strategy": "one_word_strategy_label",
-  "code": "full test method source here"
+  "strategy": "snake_case_label_under_20_chars",
+  "code": "full test method source here including using statements"
 }
 `.trim();
 
@@ -95,20 +110,23 @@ Respond in this exact JSON format:
     messages:   [{ role: 'user', content: prompt }],
   });
 
-  // ── Parse response ───────────────────────────────────────
+  // ── Parse response ────────────────────────────────────────
   const text = response.content
-    .filter(b => b.type === 'text')
-    .map(b => (b as { type: 'text'; text: string }).text)
+    .filter((b): b is Anthropic.TextBlock => b.type === 'text')
+    .map(b => b.text)
     .join('');
 
-  const clean   = text.replace(/```json|```/g, '').trim();
-  const parsed  = JSON.parse(clean) as { testName: string; strategy: string; code: string };
+  const clean  = text.replace(/```json|```/g, '').trim();
+  const parsed = JSON.parse(clean) as {
+    testName: string;
+    strategy: string;
+    code:     string;
+  };
 
-  // Derive test file name from class name
-  const ext      = sonarIssue.file.endsWith('.cs') ? 'cs'
-    : sonarIssue.file.endsWith('.tsx')              ? 'tsx'
+  // Derive test file name from class name + language
+  const ext      = sonarIssue.file.endsWith('.cs')  ? 'cs'
+    : sonarIssue.file.endsWith('.tsx')               ? 'test.tsx'
     : 'spec.ts';
-
   const fileName = `${symbol.class}Tests.${ext}`;
 
   return {

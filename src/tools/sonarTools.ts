@@ -1,71 +1,89 @@
 // ─────────────────────────────────────────────────────────────
 // @coverage agent — Sonar Tools
 // sonar_fetch · coverage_baseline
+//
+// REPLACED: raw REST calls → SonarQube official MCP server
+// (sonarsource/sonarqube-mcp)
+//
+// Config required in VS Code settings:
+//   coverage.sonarUrl   = https://sonar.yourorg.com
+//   coverage.sonarToken = <your-token>
+//
+// The MCP server handles auth, rate limiting, and pagination.
+// sonar_fetch   → MCP tool: search_issues
+// coverage_baseline → MCP tool: get_measures
 // ─────────────────────────────────────────────────────────────
 
-import {
-  SonarFetchInput,
-  SonarFetchOutput,
-  CoverageBaseline,
-} from '../types';
+import * as vscode from 'vscode';
+import { SonarFetchInput, SonarFetchOutput, CoverageBaseline, SonarIssue } from '../types';
 
-// ── sonar_fetch ─────────────────────────────────────────────
+// ── MCP client helper ────────────────────────────────────────
+// VS Code exposes connected MCP servers through the language model
+// tool API. We call SonarQube MCP tools via lm.invokeTool().
 
-export async function sonarFetch(
-  input:      SonarFetchInput,
-  sonarUrl:   string,
-  sonarToken: string,
-): Promise<SonarFetchOutput> {
-  const url =
-    `${sonarUrl}/api/issues/search`
-    + `?componentKeys=${input.projectKey}`
-    + `&branch=${input.branch}`
-    + `&types=CODE_SMELL,BUG,VULNERABILITY`
-    + `&resolved=false`;
-
-  const res = await fetch(url, {
-    headers: { Authorization: `Bearer ${sonarToken}` },
-  });
-
-  if (!res.ok) {
-    throw new Error(`sonar_fetch failed: ${res.status} ${res.statusText}`);
+async function callSonarMcp<T>(
+  toolName: string,
+  params:   Record<string, unknown>,
+): Promise<T> {
+  // Retrieve available language model tools registered by the MCP server
+  const tools = await vscode.lm.selectChatModels({ vendor: 'copilot' });
+  if (!tools.length) {
+    throw new Error('No Copilot language model available — check Copilot connection');
   }
 
-  const data = await res.json() as {
-    issues: Array<{ component: string; line: number; type: string }>;
-  };
+  // Call the MCP tool through VS Code's lm tool invocation API
+  const result = await vscode.lm.invokeTool(toolName, { input: params }, new vscode.CancellationTokenSource().token);
 
-  return {
-    issues: data.issues.map(i => ({
-      file: i.component.split(':').pop() ?? i.component,
-      line: i.line,
-      type: i.type === 'BUG' ? 'coverage' : 'branch_coverage',
-    })),
-  };
+  const text = result.content
+    .filter((c): c is vscode.LanguageModelTextPart => c instanceof vscode.LanguageModelTextPart)
+    .map(c => c.value)
+    .join('');
+
+  return JSON.parse(text) as T;
 }
 
-// ── coverage_baseline ───────────────────────────────────────
+// ── sonar_fetch ─────────────────────────────────────────────
+// Delegates to MCP tool: search_issues
+// Supports self-hosted SonarQube via SONARQUBE_URL env var
+// set in the MCP server configuration.
+
+export async function sonarFetch(
+  input: SonarFetchInput,
+): Promise<SonarFetchOutput> {
+  type McpIssue = { component: string; line: number; type: string };
+
+  const data = await callSonarMcp<{ issues: McpIssue[] }>('search_issues', {
+    projectKey: input.projectKey,
+    branch:     input.branch,
+    resolved:   false,
+  });
+
+  const issues: SonarIssue[] = data.issues.map(i => ({
+    file: i.component.split(':').pop() ?? i.component,
+    line: i.line,
+    type: i.type === 'BUG' ? 'coverage' : 'branch_coverage',
+  }));
+
+  return { issues };
+}
+
+// ── coverage_baseline ────────────────────────────────────────
+// Delegates to MCP tool: get_measures
+// Captures pre-modification metrics for reporting only.
+// NOT used as the success condition (targetCovered is).
 
 export async function coverageBaseline(
   projectKey: string,
-  sonarUrl:   string,
-  sonarToken: string,
 ): Promise<CoverageBaseline> {
-  const url =
-    `${sonarUrl}/api/measures/component`
-    + `?component=${projectKey}`
-    + `&metricKeys=coverage,branch_coverage,violations`;
+  type McpMeasure = { metric: string; value: string };
 
-  const res = await fetch(url, {
-    headers: { Authorization: `Bearer ${sonarToken}` },
+  const data = await callSonarMcp<{ measures: McpMeasure[] }>('get_measures', {
+    component:  projectKey,
+    metricKeys: ['coverage', 'branch_coverage', 'violations'],
   });
 
-  const data = await res.json() as {
-    component: { measures: Array<{ metric: string; value: string }> };
-  };
-
   const get = (key: string) =>
-    parseFloat(data.component.measures.find(m => m.metric === key)?.value ?? '0');
+    parseFloat(data.measures.find(m => m.metric === key)?.value ?? '0');
 
   return {
     coverage:       get('coverage'),

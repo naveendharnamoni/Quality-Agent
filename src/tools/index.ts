@@ -1,18 +1,22 @@
 // ─────────────────────────────────────────────────────────────
 // @coverage agent — Tools Barrel
-// Re-exports all tools grouped by category.
-// Import from here in coverageAgent.ts:
-//   import { sonarFetch, buildVerify, symbolLookup } from '../tools';
+//
+// Grouped by source — makes it clear where each tool comes from:
+//   sonarTools   → SonarQube MCP server
+//   ideTools     → VS Code built-in LSP commands
+//   analysisTools → custom built (no equivalent exists)
+//   buildTools   → Copilot built-in terminal tools +
+//                  custom coverage JSON parsing
 // ─────────────────────────────────────────────────────────────
 
-// External systems
+// SonarQube MCP server tools
 export { sonarFetch, coverageBaseline } from './sonarTools';
 
-// IDE / LSP
+// VS Code built-in LSP tools
 export { symbolLookup, findReferences, findTests } from './ideTools';
 
-// Analysis
+// Custom analysis tools — no built-in equivalent
 export { dependencyGraphAnalyze, targetCodeAnalyze } from './analysisTools';
 
-// Build & verify
+// Build + coverage verification
 export { buildVerify, targetCoverageVerify } from './buildTools';

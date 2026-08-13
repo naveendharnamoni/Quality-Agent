@@ -20,7 +20,8 @@
 12. [Tool Registry](#tool-registry)
 13. [build_verify Failure Schema](#build_verify-failure-schema)
 14. [Success Metrics](#success-metrics)
-15. [Future Enhancements](#future-enhancements)
+15. [Implementation Changes](#implementation-changes)
+16. [Future Enhancements](#future-enhancements)
 
 ---
 
@@ -46,6 +47,7 @@ The agent is **human-in-the-loop by design**. Generated tests are never applied 
 | Memory-backed retries | Prevents the agent from repeating the same failing strategy in a loop |
 | Structured build output | Pass/fail is not enough — the retry loop needs actionable failure detail |
 | Explicit escalation | Untestable candidates are surfaced to humans, not looped indefinitely |
+| Delegate to platform | Use VS Code built-in tools and official MCP servers instead of reimplementing them |
 
 ---
 
@@ -95,6 +97,8 @@ Runs **once** per agent invocation. Establishes all context that is constant acr
 
 Retrieves all SonarQube coverage targets for the selected project and branch.
 
+> **Implementation:** Delegates to the official **SonarQube MCP server** (`sonarsource/sonarqube-mcp`) via `search_issues` tool. Supports self-hosted SonarQube via `SONARQUBE_URL` + `SONARQUBE_TOKEN`. No raw REST calls needed.
+
 **Input**
 ```json
 {
@@ -126,6 +130,8 @@ Retrieves all SonarQube coverage targets for the selected project and branch.
 
 Captures coverage metrics **before** any modifications. Stored as the reference point — every subsequent delta is measured against this.
 
+> **Implementation:** Delegates to SonarQube MCP server `get_measures` tool.
+
 **Output**
 ```json
 {
@@ -135,7 +141,7 @@ Captures coverage metrics **before** any modifications. Stored as the reference 
 }
 ```
 
-> **Note:** This is stored for reporting only. It is **not** used as the primary success condition. `targetCovered == true` on the specific Sonar line is the success condition — not a coverage delta. A positive delta could come from an unrelated line while the actual target remains uncovered.
+> **Note:** Stored for reporting only. **Not** used as the primary success condition. `targetCovered == true` on the specific Sonar line is the success condition. A positive delta could come from an unrelated line while the actual target remains uncovered.
 
 ---
 
@@ -166,15 +172,11 @@ Loads the organisation-specific testing standards from a bundled static config.
 
 **This is a config lookup — not a discovery tool.**
 
-Because the organisation has standardised test patterns across all projects, there is no need to scan the codebase at runtime. The framework, mocking library, assertion style, and naming convention are already known. This makes the output **deterministic** and eliminates the risk of the agent detecting the wrong framework from an edge-case file.
+Because the organisation has standardised test patterns across all projects, there is no need to scan the codebase at runtime. The framework, mocking library, assertion style, and naming convention are already known. This makes the output **deterministic** and eliminates the risk of the agent detecting the wrong framework.
 
-`test_pattern_analyze` is intentionally **not in the per-line loop**. It runs once here in setup and the resulting `PatternSpec` is injected into the loop's context for all subsequent iterations.
+Runs **once in Phase 1**. The resulting `PatternSpec` is injected into the loop context for all subsequent iterations — never re-run per line.
 
 **Source:** `config.json` — bundled with the extension.
-
-**Output (PatternSpec)**
-
-See [Org Pattern Config](#org-pattern-config) section for the full config schema.
 
 ```json
 {
@@ -189,7 +191,7 @@ See [Org Pattern Config](#org-pattern-config) section for the full config schema
 }
 ```
 
-> **Why `maxRetries` lives in config:** Different language stacks have different complexity profiles. React component tests may need fewer retries than deeply-injected .NET service methods. Keeping this in config means it is adjustable per org and per language without touching extension code.
+> **Why `maxRetries` lives in config:** React component tests have fewer injection complexities than deeply-injected .NET services. Keeping it in config makes it adjustable per language without touching extension code.
 
 ---
 
@@ -201,7 +203,9 @@ Executed **once for each Sonar issue** returned by `sonar_fetch`. The `PatternSp
 
 ### Step 1 — `symbol_lookup`
 
-Locates the target code element using Roslyn (for .NET) or the Language Server Protocol.
+Locates the target code element using VS Code's built-in `executeDefinitionProvider` + `executeDocumentSymbolProvider`.
+
+> **Implementation:** Uses `vscode.commands.executeCommand('vscode.executeDocumentSymbolProvider')` for accurate class + method extraction from the LSP symbol tree, with text-parsing fallback.
 
 **Output**
 ```json
@@ -217,7 +221,9 @@ Locates the target code element using Roslyn (for .NET) or the Language Server P
 
 ### Step 2 — `find_references`
 
-Builds the call graph for the target method. Determines what the method calls — and therefore what will need to be mocked in the test.
+Builds the call graph for the target method. Determines what the method calls — and therefore what will need to be mocked.
+
+> **Implementation:** Uses VS Code Call Hierarchy API — `prepareCallHierarchy` + `provideIncomingCalls`. This is purpose-built for call graphs and returns structured `CallHierarchyIncomingCall` objects instead of raw `Location[]`. Gives callerClass, callerMethod, and interface — exactly what the LLM needs to determine what to mock.
 
 **Example output**
 ```
@@ -231,13 +237,15 @@ CreateOrder
 
 ### Step 3 — `find_tests`
 
-Locates existing tests related to the target. Provides the agent with real examples of how tests are written in this codebase — the most reliable pattern signal available.
+Locates existing tests related to the target. Provides the agent with real examples of how tests are written — the most reliable pattern signal available.
+
+> **Implementation:** Uses VS Code built-in `vscode.workspace.findFiles` (same mechanism as Copilot `#search/fileSearch`) for file discovery. Test name extraction via regex for both `.NET` (`[Fact]`/`[Theory]`) and JS/TS (`it()`/`test()`).
 
 **Search order**
 1. Same method
 2. Same class
-3. Same service
-4. Same feature area
+3. Same class (spec)
+4. Any test file
 
 **Output**
 ```json
@@ -253,7 +261,7 @@ Locates existing tests related to the target. Provides the agent with real examp
 
 Determines the constructor-level dependencies of the target class.
 
-> **This is the most critical setup step for test generation quality.** Missing or incorrectly mocked dependencies are the single most common reason AI-generated tests fail to compile or run.
+> **This is the most critical setup step for test generation quality.** Missing or incorrectly mocked dependencies are the single most common reason AI-generated tests fail to compile or run. No built-in VS Code tool or MCP server covers this — it is custom-built.
 
 **Example**
 ```
@@ -282,14 +290,16 @@ The `mockName` field is the field name in the class — the agent uses this to w
 
 ### Step 5 — `target_code_analyze`
 
-Analyses **only the target method** — not the whole file. This is a key design decision: in large .NET solutions, loading a 1500-line file wastes context on irrelevant code.
+Analyses **only the target method** — not the whole file. In large .NET solutions, loading a 1500-line file wastes context on irrelevant code.
+
+> **No built-in replacement exists for this tool.** It is custom-built and walks the method body brace-by-brace to extract only what is needed.
 
 **Extracts**
 - Branch count and branch conditions
 - Guard clauses and early returns
 - Exception paths (`throw`, `catch`)
 - Business rule checkpoints
-- Which injected dependencies are actually used in this method
+- Which injected dependencies are actually called in this method
 
 **Output**
 ```json
@@ -330,7 +340,7 @@ Checks whether this specific line has been attempted before. If yes, loads the f
 
 The agent generates the next candidate test.
 
-> **This is a native LLM action — not a tool call.** Keeping it as the agent's core action (rather than wrapping it in a tool) keeps the architecture clean and avoids the model calling itself indirectly.
+> **This is a native LLM action — not a tool call.** Keeping it as the agent's core action keeps the architecture clean and avoids the model calling itself indirectly.
 
 **Inputs available at generation time**
 - `PatternSpec` — from Phase 1 static config (framework, mocking lib, naming convention)
@@ -376,6 +386,8 @@ The generated test name matches the org naming convention from `PatternSpec`:
 
 Builds the project and runs the test suite. Returns structured output — not just pass/fail.
 
+> **Implementation:** Delegates to VS Code built-in Copilot tools `#execute/runInTerminal` + `#execute/getTerminalOutput` + `#execute/testFailure`. No `child_process.exec` needed.
+
 **Commands (.NET)**
 ```bash
 dotnet build
@@ -404,13 +416,15 @@ dotnet test /p:CollectCoverage=true /p:CoverletOutputFormat=json
 }
 ```
 
-> **Why structured failure output matters:** The `failureReason` field from `build_verify` is written directly into `coverage_memory` on the retry path. Without it, the memory entry only knows the attempt failed — not why. The retry loop then has no signal for choosing a different strategy.
+> **Why structured failure output matters:** The `failureReason` field is written directly into `coverage_memory` on the retry path. Without it, the memory entry only knows the attempt failed — not why. The retry loop has no signal for choosing a different strategy.
 
 ---
 
 ### Step 9 — `target_coverage_verify`
 
-Determines whether the **specific Sonar issue** was resolved — not whether overall coverage improved.
+Determines whether the **specific Sonar line** was resolved — not whether overall coverage improved.
+
+> **No built-in replacement.** Parses Coverlet/Istanbul JSON to check hit count on the exact line number. Custom-built.
 
 **Before**
 ```json
@@ -447,10 +461,9 @@ Success      Retry
 ```
 
 **Success condition:** `targetCovered == true`
-
 **Not:** `coverageDelta > 0`
 
-A coverage delta can be positive from an incidental line while the actual Sonar target remains uncovered. Checking the specific line eliminates false positives and ensures the original issue is genuinely resolved.
+A coverage delta can be positive from an incidental line while the actual Sonar target remains uncovered. Checking the specific line eliminates false positives.
 
 ---
 
@@ -459,27 +472,12 @@ A coverage delta can be positive from an incidental line while the actual Sonar 
 When `targetCovered == true`:
 
 1. **`coverage_memory.write`** — mark `resolved: true`, clear `escalate`
-2. **`git_diff`** — scoped to generated test files only (not the whole working tree)
-3. **Optional: Sonar validation scan** — triggered only if developer selects "Validate with Sonar" at review time; not run by default, as it adds latency to the happy path
-4. **Present changes to developer**
-
-**Developer sees**
-```diff
-+ [Fact]
-+ public async Task CreateOrder_Should_Throw_When_RepositoryFails()
-+ {
-+     // Arrange
-+     _repository
-+         .Setup(r => r.Save(It.IsAny<Order>()))
-+         .ThrowsAsync(new RepositoryException("DB unavailable"));
-+
-+     // Act & Assert
-+     await act.Should().ThrowAsync<RepositoryException>();
-+ }
-```
+2. **`git_diff`** — via Copilot built-in `#search/changes`, scoped to generated test files only
+3. **Optional: Sonar validation scan** — only if developer selects "Validate with Sonar"; not run by default
+4. **Present diff for human review**
 
 **Developer options**
-- **Approve** → changes applied
+- **Approve** → `#edit/editFiles` or `#edit/createFile` applies the change
 - **Reject** → discarded; memory records the rejection
 - **Modify** → developer edits inline before applying
 
@@ -491,7 +489,7 @@ When `targetCovered == true`:
 
 When `targetCovered == false`:
 
-1. **`coverage_memory.write`** — update the memory record:
+1. **`coverage_memory.write`** — log `failureReason`, increment `attemptCount`, append strategy
 
 ```json
 {
@@ -504,20 +502,16 @@ When `targetCovered == false`:
 ```
 
 2. **Check `attemptCount < maxRetries`**
-   - `true` → loop back to `target_code_analyze` with updated memory context; agent selects a strategy not in `strategiesAttempted[]`
-   - `false` → escalate (see below)
+   - `true` → loop back to `target_code_analyze` with updated memory; agent picks a strategy not in `strategiesAttempted[]`
+   - `false` → escalate
 
 **Agent retry visibility in chat**
-
-The agent surfaces retry state in the chat UI so the developer is always informed:
 
 ```
 [Attempt 2/3] — Previous strategy (mock_throw) failed:
 "Dependency throws before reaching target branch"
 Trying: cache_miss scenario
 ```
-
-This transparency is especially important for getting enterprise team buy-in — the agent should never appear to be silently spinning.
 
 ---
 
@@ -526,10 +520,7 @@ This transparency is especially important for getting enterprise team buy-in —
 When `attemptCount >= maxRetries`:
 
 ```json
-{
-  "escalate": true,
-  "resolved": false
-}
+{ "escalate": true, "resolved": false }
 ```
 
 **Surfaced to developer as:**
@@ -548,13 +539,13 @@ Possible reasons:
 Recommended action: Review manually or suppress Sonar issue with justification.
 ```
 
-**Agent stops retrying this line.** It moves to the next issue in the queue.
+**Agent stops retrying this line** and moves to the next issue in the queue.
 
 ---
 
 ## Coverage Memory
 
-Persisted per line. Read before generation, written after every attempt (success or failure).
+Persisted per line using `vscode.ExtensionContext.globalState`. Read before generation, written after every attempt.
 
 **Full schema**
 ```json
@@ -579,10 +570,10 @@ Persisted per line. Read before generation, written after every attempt (success
 |---|---|---|
 | `attempted` | `bool` | Has this line been tried before |
 | `attemptCount` | `int` | Current retry count |
-| `failureReason` | `string` | From `build_verify` failure output — why the last attempt failed |
+| `failureReason` | `string` | From `build_verify` — why the last attempt failed |
 | `strategiesAttempted[]` | `string[]` | Agent must pick a strategy not in this list |
-| `resolved` | `bool` | Set `true` on success path; ensures line is never retried |
-| `escalate` | `bool` | Set `true` when `attemptCount >= maxRetries`; skips line in all future runs |
+| `resolved` | `bool` | Set `true` on success; line never retried |
+| `escalate` | `bool` | Set `true` when `attemptCount >= maxRetries`; skipped in future runs |
 
 ---
 
@@ -590,7 +581,7 @@ Persisted per line. Read before generation, written after every attempt (success
 
 Bundled with the extension as `config.json`. **One entry per supported language.**
 
-No scanning. No inference. `test_pattern_lookup` is a key lookup against this file using the `projectType` from `file_type_detect`.
+No scanning. No inference. `test_pattern_lookup` is a key lookup using the `projectType` from `file_type_detect`.
 
 ```json
 {
@@ -625,58 +616,47 @@ No scanning. No inference. `test_pattern_lookup` is a key lookup against this fi
 }
 ```
 
-**Why `maxRetries` is per language:** React component tests have fewer dependency injection complexities than deeply-injected .NET services. Keeping `maxRetries` in config lets the org tune it per stack without touching extension code.
-
-**Why `naming` matters:** The `naming` field is injected verbatim into the LLM prompt. Generated test names will match org convention exactly — indistinguishable from human-written tests. This is the field code reviewers notice most.
+**Why `naming` matters:** The `naming` field is injected verbatim into the LLM prompt. Generated test names match org convention exactly — indistinguishable from human-written tests.
 
 ---
 
 ## Tool Registry
 
-### External Systems
+### External Systems — via SonarQube MCP Server
+| Tool | MCP Tool Used | Purpose |
+|---|---|---|
+| `sonar_fetch` | `search_issues` | Pull coverage issues from self-hosted SonarQube |
+| `coverage_baseline` | `get_measures` | Capture pre-modification metrics |
+
+### Build & Apply — via Copilot Built-in Tools
+| Tool | Copilot Tool Used | Purpose |
+|---|---|---|
+| `build_verify` | `#execute/runInTerminal` + `#execute/getTerminalOutput` + `#execute/testFailure` | Run build + tests, get structured output |
+| `git_diff` | `#search/changes` | Diff scoped to generated test files |
+| Apply test | `#edit/editFiles` / `#edit/createFile` | Write approved test to disk |
+
+### IDE / LSP — via VS Code Built-in Commands
+| Tool | VS Code API Used | Purpose |
+|---|---|---|
+| `symbol_lookup` | `executeDefinitionProvider` + `executeDocumentSymbolProvider` | Resolve target class and method |
+| `find_references` | `prepareCallHierarchy` + `provideIncomingCalls` | Build structured call graph for mocking |
+| `find_tests` | `workspace.findFiles` | Locate existing tests by search order |
+
+### Custom Built — No Existing Equivalent
 | Tool | Purpose |
 |---|---|
-| `sonar_fetch` | Pull coverage issues from SonarQube API |
-| `build_verify` | Build project and run test suite with coverage collection |
-| `git_diff` | Generate diff scoped to generated test files only |
-
-### IDE / LSP
-| Tool | Purpose |
-|---|---|
-| `file_type_detect` | Map file extension to project type |
-| `symbol_lookup` | Resolve target symbol via Roslyn / LSP |
-| `find_references` | Build call graph for mocking requirements |
-| `find_tests` | Locate existing tests for the target class/method |
-
-### Analysis
-| Tool | Purpose |
-|---|---|
-| `coverage_baseline` | Capture pre-modification metrics for reporting |
-| `dependency_graph_analyze` | Extract constructor dependencies and mock names |
-| `target_code_analyze` | Analyse target method — branches, guards, exceptions |
-| `target_coverage_verify` | Confirm the specific Sonar line is now covered |
-
-### Configuration
-| Tool | Purpose |
-|---|---|
-| `test_pattern_lookup` | Load org pattern spec from static `config.json` |
-
-### Memory
-| Tool | Purpose |
-|---|---|
-| `coverage_memory.read` | Load attempt history before generation |
-| `coverage_memory.write` | Persist attempt result after build_verify |
-
-### Native Agent Action
-| Action | Purpose |
-|---|---|
-| `generate_test` | LLM writes the test — not a tool call |
+| `dependency_graph_analyze` | Constructor parameter extraction + mock name resolution |
+| `target_code_analyze` | Method body extraction — branches, guards, exceptions, dep usage |
+| `target_coverage_verify` | Parse Coverlet/Istanbul JSON to confirm specific line is hit |
+| `coverage_memory.read/write` | Per-line attempt history — prevents strategy repetition |
+| `test_pattern_lookup` | Static org config key lookup |
+| `generate_test` | LLM native action — not a tool call |
 
 ---
 
 ## `build_verify` Failure Schema
 
-The failure output from `build_verify` is the primary signal for `coverage_memory.write` on the retry path. It must be structured — not just a boolean.
+The failure output from `build_verify` feeds directly into `coverage_memory.write` on the retry path. Must be structured — not just a boolean.
 
 ```json
 {
@@ -689,7 +669,7 @@ The failure output from `build_verify` is the primary signal for `coverage_memor
 }
 ```
 
-Common `failureReason` values the agent uses to switch strategy:
+Common `failureReason` values and next strategy:
 
 | Reason | Next strategy |
 |---|---|
@@ -719,12 +699,224 @@ Common `failureReason` values the agent uses to switch strategy:
 
 ---
 
+## Implementation Changes
+
+This section documents every decision made during design and development that changes what is built, replaced, or dropped compared to the initial approach.
+
+---
+
+### IC-01 — SonarQube MCP Server replaces raw REST calls
+
+**What changed:** `sonarTools.ts` no longer makes raw `fetch()` calls to the SonarQube REST API.
+
+**Old approach**
+```typescript
+const res = await fetch(`${sonarUrl}/api/issues/search?...`, {
+  headers: { Authorization: `Bearer ${sonarToken}` },
+});
+```
+
+**New approach**
+```typescript
+// Delegates to official SonarQube MCP server (sonarsource/sonarqube-mcp)
+const data = await callSonarMcp('search_issues', { projectKey, branch });
+```
+
+**Why:** The official MCP server handles authentication, rate limiting, pagination, and API versioning. It supports self-hosted SonarQube via `SONARQUBE_URL` + `SONARQUBE_TOKEN` environment variables — pointing at your org's server requires only setting those two values.
+
+**MCP tools used**
+| sonarTools.ts function | MCP tool |
+|---|---|
+| `sonarFetch` | `search_issues` |
+| `coverageBaseline` | `get_measures` |
+
+**MCP server config**
+```bash
+SONARQUBE_URL=https://sonar.yourorg.com
+SONARQUBE_TOKEN=your-token-here
+```
+
+---
+
+### IC-02 — Call Hierarchy API replaces executeReferenceProvider
+
+**What changed:** `find_references` in `ideTools.ts` now uses `prepareCallHierarchy` + `provideIncomingCalls` instead of `vscode.executeReferenceProvider`.
+
+**Old approach**
+```typescript
+const refs = await vscode.commands.executeCommand<vscode.Location[]>(
+  'vscode.executeReferenceProvider', uri, position,
+);
+// Returns raw Location[] — needs manual parsing to get caller class/method
+```
+
+**New approach**
+```typescript
+const items = await vscode.commands.executeCommand<vscode.CallHierarchyItem[]>(
+  'vscode.prepareCallHierarchy', uri, position,
+);
+const incomingCalls = await vscode.commands.executeCommand<vscode.CallHierarchyIncomingCall[]>(
+  'vscode.provideIncomingCalls', items[0],
+);
+// Returns structured CallHierarchyIncomingCall — callerClass, callerMethod, interface
+```
+
+**Why:** The Call Hierarchy API is purpose-built for "who calls this method" questions. It returns `CallerInfo` objects with class name, method name, and interface — directly what the LLM needs to determine what to mock. The old `Location[]` approach required fragile text parsing to extract the same information.
+
+**New type added to `types.ts`**
+```typescript
+export interface CallerInfo {
+  callerClass:  string;
+  callerMethod: string;
+  interface:    string;
+}
+```
+
+---
+
+### IC-03 — DocumentSymbolProvider replaces regex for symbol_lookup
+
+**What changed:** `symbol_lookup` in `ideTools.ts` now uses `executeDocumentSymbolProvider` to extract class and method names from the LSP symbol tree, with text-parsing as fallback only.
+
+**Old approach**
+```typescript
+const text        = doc.lineAt(def.range.start.line).text.trim();
+const methodMatch = text.match(/(?:async\s+)?[\w<>]+\s+(\w+)\s*\(/);
+const classMatch  = doc.getText().match(/class\s+(\w+)/);
+```
+
+**New approach**
+```typescript
+const symbols = await vscode.commands.executeCommand<vscode.DocumentSymbol[]>(
+  'vscode.executeDocumentSymbolProvider', def.uri,
+);
+// Walk symbol tree: Class → child symbol that contains target position → method name
+```
+
+**Why:** Regex on raw text breaks on generic methods, partial classes, attributes, and multiline signatures. The LSP symbol tree is accurate regardless of code style.
+
+---
+
+### IC-04 — Copilot built-in tools replace child_process for build_verify
+
+**What changed:** `build_verify` in `buildTools.ts` no longer uses Node's `child_process.exec`. It delegates to Copilot's built-in terminal tools.
+
+**Old approach**
+```typescript
+import * as cp from 'child_process';
+cp.exec('dotnet test /p:CollectCoverage=true', { cwd: workspaceRoot }, callback);
+```
+
+**New approach**
+```typescript
+// Delegates to VS Code Copilot built-in tools:
+// #execute/runInTerminal    — runs the command
+// #execute/getTerminalOutput — gets structured stdout/stderr
+// #execute/testFailure      — gets structured test failure detail
+```
+
+**Why:** Copilot's terminal tools handle output streaming, VS Code task integration, and structured test failure parsing. `#execute/testFailure` returns typed test failure objects — no regex parsing of stdout needed.
+
+---
+
+### IC-05 — Copilot built-in tools replace manual file apply
+
+**What changed:** `applyGeneratedTest` in `extension.ts` no longer uses `fs.writeFile` / `fs.readFile` to apply test files to disk.
+
+**Old approach**
+```typescript
+import * as fs from 'fs/promises';
+await fs.writeFile(filePath, updated, 'utf-8');
+```
+
+**New approach**
+```typescript
+// Delegates to Copilot built-in edit tools:
+// #edit/createFile — when test file doesn't exist yet
+// #edit/editFiles  — when appending to existing test class
+```
+
+**Why:** Copilot's edit tools handle file creation, diff preview, and undo history natively within VS Code. The developer sees the same diff view they'd see for any other Copilot suggestion.
+
+---
+
+### IC-06 — Copilot #search/changes replaces git shell call for git_diff
+
+**What changed:** `git_diff` no longer shells out to `git diff`.
+
+**Old approach**
+```typescript
+cp.exec('git diff --name-only HEAD', ...);
+```
+
+**New approach**
+```typescript
+// Delegates to Copilot built-in: #search/changes
+// Scoped to generated test files only
+```
+
+**Why:** `#search/changes` integrates with VS Code's source control model directly and respects any SCM provider (Git, Azure Repos, etc.) without assuming `git` is on PATH.
+
+---
+
+### IC-07 — LangChain / LangGraph explicitly ruled out
+
+**Decision:** No orchestration framework is used. The retry loop is plain TypeScript.
+
+**Rationale:**
+- LangChain/LangGraph are Python-first. The extension must be TypeScript.
+- The agent has one loop with one decision node — a `while` loop is the correct abstraction.
+- Adding a framework adds a heavyweight dependency for zero architectural benefit.
+
+```typescript
+// The entire "orchestration" is this
+while (!targetCovered && attemptCount < maxRetries) {
+  const memory      = await coverageMemory.read(file, line);
+  const codeAnalysis = await targetCodeAnalyze(symbol);
+  const generated   = await generateTest({ ...context, memory, codeAnalysis });
+  const buildResult = await buildVerify(workspaceRoot, projectType);
+  targetCovered     = (await targetCoverageVerify(file, line, buildResult)).targetCovered;
+  await coverageMemory.writeFailure(file, line, generated.strategy, buildResult);
+  attemptCount++;
+}
+```
+
+---
+
+### IC-08 — test_pattern_analyze removed from retry loop
+
+**Decision:** `test_pattern_analyze` runs **once in Phase 1** as a static config lookup. It does not re-run per line or per retry.
+
+**Why:** The organisation has standardised test patterns across .NET, Angular, and React. There is nothing to discover at runtime. Running it per iteration would re-detect the same result on every pass and waste tokens.
+
+**Consequence:** `sonarTools.ts` was removed entirely in v2. `test_pattern_lookup` in `patternConfig.ts` is a pure key lookup against `ORG_CONFIG` — no file I/O, no scanning.
+
+---
+
+### IC-09 — sonarTools.ts removed as a standalone file
+
+**Decision:** `sonarTools.ts` is retained in the project but its implementation now wraps MCP calls only. The file exists to maintain a clean tool boundary — if the MCP server API changes, only this file needs updating.
+
+**Note for SonarQube self-hosted setup:** The MCP server must be configured with your org's server details before the extension will work. See IC-01 for the required environment variables.
+
+---
+
+### IC-10 — File structure flattened from types/index.ts to types.ts
+
+**Decision:** The nested `src/types/index.ts` was replaced with a flat `src/types.ts`.
+
+**Why:** `types/index.ts` contained one file — there was nothing to barrel. The `index.ts` convention is only useful when a folder contains multiple files that need a single re-export point. A single types file at `src/types.ts` is simpler and imports are identical:
+```typescript
+import { SonarIssue, PatternSpec } from '../types'; // unchanged either way
+```
+
+---
+
 ## Future Enhancements
 
 ### Phase 2 — `@sonar.fix`
 
 Extend the agent to address non-coverage Sonar issues:
-
 - Fix code smells
 - Fix security vulnerabilities
 - Fix security hotspots
@@ -733,18 +925,18 @@ Same tool architecture, different Sonar issue types as input.
 
 ### Phase 3 — MCP Server Integration
 
-Expose the agent's toolchain as an MCP server:
+Expose the agent's toolchain as a standalone MCP server:
 
 ```
 MCP Server
- ├── SonarQube API tools
- ├── Roslyn analysis tools
- ├── Build pipeline tools
- ├── Coverage report tools
- └── Git operation tools
+ ├── SonarQube API tools     (via sonarsource/sonarqube-mcp passthrough)
+ ├── Roslyn analysis tools   (dependency_graph_analyze, target_code_analyze)
+ ├── Build pipeline tools    (build_verify, target_coverage_verify)
+ ├── Coverage memory tools   (read, write)
+ └── Git operation tools     (git_diff)
 ```
 
-**Why this matters:** Copilot Chat, future AI agents, and CI pipelines can all reuse the same toolchain without rewriting VS Code extension logic. The `@coverage` extension becomes one consumer of the MCP server — not the only one.
+Copilot Chat, CI pipelines, and future AI agents can all reuse the same toolchain without rewriting VS Code extension logic.
 
 ---
 

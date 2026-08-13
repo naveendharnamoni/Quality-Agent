@@ -2,22 +2,24 @@
 // @coverage agent — Build Tools
 // build_verify · target_coverage_verify
 //
-// build_verify runs the appropriate test command per stack
-// and returns STRUCTURED output — not just pass/fail.
-// The failureReason field is what feeds coverage_memory
-// on the retry path, so it must be actionable.
+// UPDATED (IC-04):
+//   build_verify now delegates to Copilot built-in tools:
+//     #execute/runInTerminal    — runs dotnet/ng/react test cmd
+//     #execute/getTerminalOutput — gets structured stdout/stderr
+//     #execute/testFailure      — structured test failure detail
+//   No child_process.exec needed.
+//
+// target_coverage_verify has no built-in equivalent.
+//   Parses Coverlet/Istanbul JSON to confirm the SPECIFIC
+//   Sonar line is hit — not just that overall coverage went up.
 // ─────────────────────────────────────────────────────────────
 
-import * as cp   from 'child_process';
-import * as fs   from 'fs/promises';
-import * as path from 'path';
-import {
-  BuildVerifyOutput,
-  TargetCoverageOutput,
-  ProjectType,
-} from '../types';
+import * as vscode from 'vscode';
+import * as fs     from 'fs/promises';
+import * as path   from 'path';
+import { BuildVerifyOutput, TargetCoverageOutput, ProjectType } from '../types';
 
-// ── build_verify ────────────────────────────────────────────
+// ── build_verify ─────────────────────────────────────────────
 
 const BUILD_COMMANDS: Record<ProjectType, string> = {
   dotnet:  'dotnet test /p:CollectCoverage=true /p:CoverletOutputFormat=json',
@@ -29,42 +31,66 @@ export async function buildVerify(
   workspaceRoot: string,
   projectType:   ProjectType,
 ): Promise<BuildVerifyOutput> {
-  return new Promise(resolve => {
-    cp.exec(
-      BUILD_COMMANDS[projectType],
-      { cwd: workspaceRoot, timeout: 120_000 },
-      (err, stdout, stderr) => {
-        if (!err) {
-          const passed = parseInt(stdout.match(/(\d+) passed/)?.[1] ?? '0');
-          const failed = parseInt(stdout.match(/(\d+) failed/)?.[1] ?? '0');
+  const command = BUILD_COMMANDS[projectType];
 
-          resolve({
-            buildSuccess: true,
-            testsPassed:  passed,
-            testsFailed:  failed,
-            coverageFile: path.join(workspaceRoot, 'coverage.json'),
-          });
-        } else {
-          const compilerError = stderr.match(/error \w+\d+: (.+)/)?.[1];
-          const testError     = stdout.match(/Failed:\s+(.+)/)?.[1];
-          const rawError      = compilerError ?? testError ?? stderr.slice(0, 200);
-
-          resolve({
-            buildSuccess:  false,
-            testsPassed:   0,
-            testsFailed:   1,
-            error:         rawError,
-            failureReason: classifyFailure(rawError),
-            coverageFile:  null,
-          });
-        }
-      },
-    );
+  // Delegate to Copilot built-in terminal execution
+  // #execute/runInTerminal runs the command in the integrated terminal
+  await vscode.commands.executeCommand('workbench.action.terminal.sendSequence', {
+    text: `cd "${workspaceRoot}" && ${command}\n`,
   });
+
+  // #execute/getTerminalOutput — wait briefly then read terminal output
+  // In production wire this to the terminal data event for reliability
+  await new Promise(r => setTimeout(r, 8000));
+
+  const terminalOutput = await vscode.commands.executeCommand<string>(
+    'workbench.action.terminal.getLastOutput',
+  ) ?? '';
+
+  // #execute/testFailure — get structured test failures if any
+  const testDiagnostics = vscode.languages.getDiagnostics();
+  const errors = testDiagnostics
+    .flatMap(([, diags]) => diags)
+    .filter(d => d.severity === vscode.DiagnosticSeverity.Error);
+
+  if (errors.length > 0) {
+    const rawError = errors[0].message;
+    return {
+      buildSuccess:  false,
+      testsPassed:   0,
+      testsFailed:   errors.length,
+      error:         rawError,
+      failureReason: classifyFailure(rawError),
+      coverageFile:  null,
+    };
+  }
+
+  // Parse pass/fail counts from terminal output
+  const passed = parseInt(terminalOutput.match(/(\d+) passed/)?.[1]  ?? '0');
+  const failed = parseInt(terminalOutput.match(/(\d+) failed/)?.[1]  ?? '0');
+
+  if (failed > 0) {
+    const testError = terminalOutput.match(/Failed:\s+(.+)/)?.[1] ?? 'Test failed';
+    return {
+      buildSuccess:  false,
+      testsPassed:   passed,
+      testsFailed:   failed,
+      error:         testError,
+      failureReason: classifyFailure(testError),
+      coverageFile:  null,
+    };
+  }
+
+  return {
+    buildSuccess: true,
+    testsPassed:  passed,
+    testsFailed:  0,
+    coverageFile: path.join(workspaceRoot, 'coverage.json'),
+  };
 }
 
-// Maps raw compiler/test output to a human-readable reason
-// that gets written into coverage_memory for the retry loop
+// Maps raw error text to a human-readable failureReason that
+// gets written into coverage_memory for the retry loop signal
 function classifyFailure(error: string): string {
   if (/could not be found|not found/i.test(error))
     return 'Missing using directive for mocked dependency';
@@ -74,14 +100,13 @@ function classifyFailure(error: string): string {
     return 'Test method not detected — check naming convention';
   if (/timeout/i.test(error))
     return 'Build timeout — project may have unresolved references';
-  return error;
+  return error.slice(0, 200);
 }
 
-// ── target_coverage_verify ──────────────────────────────────
-//
-// Checks the SPECIFIC Sonar line — not overall coverage delta.
-// A positive delta could come from an unrelated line while the
-// actual target remains uncovered.
+// ── target_coverage_verify ───────────────────────────────────
+// No built-in replacement — custom Coverlet/Istanbul JSON parsing.
+// Checks targetCovered on the SPECIFIC Sonar line number.
+// A positive coverage delta is not sufficient — the exact line must be hit.
 
 export async function targetCoverageVerify(
   file:         string,

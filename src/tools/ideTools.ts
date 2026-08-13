@@ -2,20 +2,27 @@
 // @coverage agent — IDE / LSP Tools
 // symbol_lookup · find_references · find_tests
 //
-// All three tools call VS Code's built-in LSP providers.
-// They work for .NET (OmniSharp/Roslyn), Angular (TS server),
-// and React (TS server) without any extra setup.
+// UPDATED from previous version:
+//   find_references → now uses prepareCallHierarchy +
+//     provideIncomingCalls (purpose-built for call graphs,
+//     returns structured CallerInfo instead of raw Location[])
+//   find_tests → delegates file search + text scan to
+//     VS Code built-in workspace APIs (same as Copilot
+//     #search/fileSearch + #search/textSearch internally)
 // ─────────────────────────────────────────────────────────────
 
 import * as vscode from 'vscode';
-import * as path   from 'path';
 import {
   SymbolLocation,
   FindReferencesOutput,
+  CallerInfo,
   FindTestsOutput,
 } from '../types';
 
-// ── symbol_lookup ───────────────────────────────────────────
+// ── symbol_lookup ────────────────────────────────────────────
+// Uses vscode.executeDefinitionProvider to locate the symbol,
+// then vscode.executeDocumentSymbolProvider to extract the
+// class name from the document symbol tree.
 
 export async function symbolLookup(
   file: string,
@@ -34,23 +41,53 @@ export async function symbolLookup(
     throw new Error(`symbol_lookup: no definition found at ${file}:${line}`);
   }
 
-  const def  = definitions[0];
-  const doc  = await vscode.workspace.openTextDocument(def.uri);
-  const text = doc.lineAt(def.range.start.line).text.trim();
+  const def = definitions[0];
+  const doc = await vscode.workspace.openTextDocument(def.uri);
 
-  // Extract method name: "public async Task<Order> CreateOrder(..."
-  const methodMatch = text.match(/(?:async\s+)?[\w<>]+\s+(\w+)\s*\(/);
-  const classMatch  = doc.getText().match(/class\s+(\w+)/);
+  // Use document symbol provider for accurate class + method extraction
+  // instead of regex on raw text
+  const symbols = await vscode.commands.executeCommand<vscode.DocumentSymbol[]>(
+    'vscode.executeDocumentSymbolProvider',
+    def.uri,
+  );
+
+  let className  = 'Unknown';
+  let methodName = 'Unknown';
+
+  if (symbols) {
+    for (const sym of symbols) {
+      if (sym.kind === vscode.SymbolKind.Class) {
+        className = sym.name;
+        const child = sym.children.find(
+          c => c.range.contains(def.range.start),
+        );
+        if (child) { methodName = child.name; }
+      }
+    }
+  }
+
+  // Fallback to text parsing if LSP symbols unavailable
+  if (methodName === 'Unknown') {
+    const text        = doc.lineAt(def.range.start.line).text.trim();
+    const methodMatch = text.match(/(?:async\s+)?[\w<>]+\s+(\w+)\s*\(/);
+    const classMatch  = doc.getText().match(/class\s+(\w+)/);
+    methodName = methodMatch?.[1] ?? 'Unknown';
+    className  = classMatch?.[1]  ?? 'Unknown';
+  }
 
   return {
-    class:  classMatch?.[1]  ?? 'Unknown',
-    method: methodMatch?.[1] ?? 'Unknown',
+    class:  className,
+    method: methodName,
     file:   def.uri.fsPath,
     line:   def.range.start.line + 1,
   };
 }
 
-// ── find_references ─────────────────────────────────────────
+// ── find_references ──────────────────────────────────────────
+// UPGRADED: uses Call Hierarchy API instead of executeReferenceProvider.
+// prepareCallHierarchy + provideIncomingCalls returns structured
+// CallerInfo — who calls this method and from which class.
+// This is directly what the LLM needs to determine what to mock.
 
 export async function findReferences(
   symbol: SymbolLocation,
@@ -58,34 +95,54 @@ export async function findReferences(
   const uri      = vscode.Uri.file(symbol.file);
   const position = new vscode.Position(symbol.line - 1, 0);
 
-  const refs = await vscode.commands.executeCommand<vscode.Location[]>(
-    'vscode.executeReferenceProvider',
+  // Step 1: prepare call hierarchy item for the target method
+  const items = await vscode.commands.executeCommand<vscode.CallHierarchyItem[]>(
+    'vscode.prepareCallHierarchy',
     uri,
     position,
   );
 
-  const references = (refs ?? []).map(r => ({
-    callee:    path.basename(r.uri.fsPath),
-    interface: 'Unknown', // enriched downstream by dependency_graph_analyze
-  }));
+  if (!items?.length) {
+    return { method: symbol.method, callers: [] };
+  }
 
-  return { method: symbol.method, references };
+  // Step 2: get incoming calls — who calls this method
+  const incomingCalls = await vscode.commands.executeCommand<vscode.CallHierarchyIncomingCall[]>(
+    'vscode.provideIncomingCalls',
+    items[0],
+  );
+
+  const callers: CallerInfo[] = (incomingCalls ?? []).map(call => {
+    // Extract interface from caller name — convention: ISomething
+    const interfaceMatch = call.from.name.match(/I[A-Z]\w+/);
+
+    return {
+      callerClass:  call.from.detail ?? 'Unknown',
+      callerMethod: call.from.name,
+      interface:    interfaceMatch?.[0] ?? call.from.detail ?? 'Unknown',
+    };
+  });
+
+  return { method: symbol.method, callers };
 }
 
-// ── find_tests ──────────────────────────────────────────────
+// ── find_tests ───────────────────────────────────────────────
+// Uses VS Code built-in workspace.findFiles (same underlying
+// mechanism as Copilot #search/fileSearch).
+// Searches in priority order: method → class → spec → any tests.
+// Extracts test names via regex for both .NET and JS/TS.
 
 export async function findTests(
   symbol: SymbolLocation,
 ): Promise<FindTestsOutput> {
-  // Search order: same method → same class → same class (spec) → any test file
-  const patterns = [
-    `**/*${symbol.method}*Test*`,
+  const searchPatterns = [
+    `**/*${symbol.method}*Test*`,    // most specific first
     `**/*${symbol.class}*Test*`,
     `**/*${symbol.class}*Spec*`,
     `**/*Tests*`,
   ];
 
-  for (const pattern of patterns) {
+  for (const pattern of searchPatterns) {
     const files = await vscode.workspace.findFiles(
       pattern,
       '**/node_modules/**',
@@ -94,22 +151,19 @@ export async function findTests(
 
     if (files.length === 0) { continue; }
 
-    const testFiles: string[]    = files.map(f => f.fsPath);
+    const testFiles     = files.map(f => f.fsPath);
     const existingTests: string[] = [];
 
-    // Extract test method names from the first matched file
     const doc  = await vscode.workspace.openTextDocument(files[0]);
     const text = doc.getText();
 
-    // .NET xUnit — [Fact] / [Theory] attribute above method
-    const dotnetMatches = [
-      ...text.matchAll(/\[(?:Fact|Theory)\]\s*\n\s*public[^(]+(\w+)\s*\(/g),
-    ];
-    dotnetMatches.forEach(m => existingTests.push(m[1]));
+    // .NET xUnit — [Fact] / [Theory] attribute
+    [...text.matchAll(/\[(?:Fact|Theory)\]\s*\n\s*public[^(]+(\w+)\s*\(/g)]
+      .forEach(m => existingTests.push(m[1]));
 
-    // JS/TS — it('...') or test('...')
-    const jsMatches = [...text.matchAll(/(?:it|test)\(['"`]([^'"`]+)/g)];
-    jsMatches.forEach(m => existingTests.push(m[1]));
+    // JS/TS Jest/Jasmine — it('...') / test('...')
+    [...text.matchAll(/(?:it|test)\(['"`]([^'"`]+)/g)]
+      .forEach(m => existingTests.push(m[1]));
 
     return { testFiles, existingTests };
   }
